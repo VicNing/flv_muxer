@@ -20,7 +20,11 @@ const PRIMITIVE_TYPE = {
 
 const DATA_TYPE = {
     BITS: 'bits',
-    FLVTAG: 'flvtag'
+    FLVTAG: 'flvtag',
+    AUDIODATA: 'audiodata',
+    VIDEODATA: 'videodata',
+    SCRIPTDATA: 'scriptDat',
+    SCRIPTDATAOBJECT: 'scriptDataObject',
 }
 
 const HEADER_SPEC = {
@@ -98,12 +102,14 @@ const BODY_FIELD = {
     PREVIOUS_TAG_SIZE: 'previousTagSize',
     TAG: 'tag'
 };
+
 const BODY_SPEC = {
     0: {
         field: BODY_FIELD.PREVIOUS_TAG_SIZE,
-        desc: '',
+        desc: buf => `previous tag size is ${buf.buffer.readUInt32BE(0)}`,
         length: 1,
-        type: PRIMITIVE_TYPE.UINT32
+        type: PRIMITIVE_TYPE.UINT32,
+
     },
     1: {
         field: BODY_FIELD.TAG,
@@ -125,16 +131,30 @@ const TAG_FILED = {
 const TAG_SPEC = {
     0: {
         field: TAG_FILED.TAG_TYPE,
-        desc: function (value) {
-            switch (value) {
+        eval: buf => {
+            let integer = buf.buffer.readUInt8(0);
+            switch (integer) {
                 case 8:
-                    break;
+                    return DATA_TYPE.AUDIODATA
                 case 9:
-                    break;
-                case 10:
-                    break;
+                    return DATA_TYPE.VIDEODATA
+                case 18:
+                    return DATA_TYPE.SCRIPTDATA
                 default:
-                    break;
+                    return null;
+            }
+        },
+        desc: (buf, offset) => {
+            let integer = buf.buffer.readUInt8(0);
+            switch (integer) {
+                case 8:
+                    return `it's a audio tag `
+                case 9:
+                    return `it's a video tag `
+                case 18:
+                    return `it's a script data`
+                default:
+                    return 'reserved value'
             }
         },
         type: PRIMITIVE_TYPE.UINT8,
@@ -143,19 +163,34 @@ const TAG_SPEC = {
     1: {
         field: TAG_FILED.DATA_SIZE,
         type: PRIMITIVE_TYPE.UINT24,
-        length: 1
+        length: 1,
+        desc: (buf, offset, [datasize]) => `length of the data in the data field is ${datasize} bytes`
     },
     4: {
         field: TAG_FILED.TIMESTAMP,
-        type: PRIMITIVE_TYPE.UINT24
+        type: PRIMITIVE_TYPE.UINT24,
+        length: 1,
+        eval: buf => buf.buffer.readUIntBE(0, 3)
     },
     7: {
         field: TAG_FILED.TIMESTAMP_EXTENDED,
-        type: PRIMITIVE_TYPE.UINT8
+        type: PRIMITIVE_TYPE.UINT8,
+        length: 1,
+        eval: (buf, timestamp) => buf.buffer.readUInt8(0) << 4 + timestamp,
+        desc: (buf, offset, [timestamp]) => `this tag applies to data at ${timestamp} ms`
     },
     8: {
         field: TAG_FILED.STREAM_ID,
-        type: PRIMITIVE_TYPE.UINT24
+        type: PRIMITIVE_TYPE.UINT24,
+        predicate: buf => {
+            if (buf.buffer.readUIntBE(0, 3) === 0) {
+                return true;
+            } else {
+                throw new Error('predicate not passed!');
+            }
+        },
+        desc: 'stream id always 0',
+        length: 1
     },
     11: {
         field: TAG_FILED.DATA,
@@ -163,17 +198,65 @@ const TAG_SPEC = {
     }
 };
 
+const SCRIPT_DATA_OBJECT_FIELD = {
+    OBJECTS: 'objects',
+    END: 'end'
+};
+
+const SCRIPT_DATA_OBJECT_SPEC = {
+    0: {
+        field: SCRIPT_DATA_OBJECT_FIELD.OBJECTS,
+        type: DATA_TYPE.SCRIPTDATAOBJECT,
+        length: undefined,
+    },
+    e: {
+        field: SCRIPT_DATA_OBJECT_FIELD.END,
+        type: PRIMITIVE_TYPE.UINT24,
+        length: 1,
+        predicate: buf => {
+            if (buf.buffer.readUIntBE(0, 3) === 9) {
+                return true
+            } else {
+                throw new Error('end of scriptDataObject must be 9!');
+            }
+        },
+        desc: 'it\'s the end of scriptDataObject'
+    }
+}
+
 const describe = function (frame, offset, bit) {
     let describe = `it ${frame.desc} ${typeof bit === 'number' ? `in bit ${bit}` : ''} at offset ${offset}`;
     console.log(describe);
     return describe;
 }
 
+const speak = function (frame, buf, offset, ...rest) {
+    if (frame.desc) {
+        if (typeof frame.desc === 'string') {
+            return frame.desc;
+        } else if (typeof frame.desc === 'function') {
+            return frame.desc(buf, offset, rest);
+        }
+    }
+}
+
+const log = function (word) {
+    if (typeof word === 'string') {
+        console.log(word);
+    }
+}
+
 const typeLength = function (type, length) {
+    if (!type || !length) {
+        throw new Error('invalid parameter type!');
+    }
     let byteLength = 0;
     switch (type) {
         case PRIMITIVE_TYPE.UINT8:
             byteLength = 1;
+            break;
+        case PRIMITIVE_TYPE.UINT24:
+            byteLength = 3;
             break;
         case PRIMITIVE_TYPE.UINT32:
             byteLength = 4;
@@ -181,22 +264,23 @@ const typeLength = function (type, length) {
         case PRIMITIVE_TYPE.UBYTE:
             byteLength = 1;
             break;
+        case DATA_TYPE.SCRIPTDATAOBJECT:
+            byteLength = 1;
+            break;
         default:
             throw new Error(`typeLength doesn\'t have type ${type}`);
     }
-    let totalLength = byteLength * length;
-    return totalLength;
+    return byteLength * length;
 }
 
 const sliceByteChunk = function (chunk, offset, length, type) {
-    let totalLength = typeLength(type, length);
+    let bufferLength = typeLength(type, length);
     let byteArray = [];
-    for (let i = 0; i < totalLength; i++) {
+    for (let i = 0; i < bufferLength; i++) {
         byteArray.push(chunk[offset]);
         offset++;
     }
-    let slice = Buffer.from(byteArray);
-    return { slice, totalLength };
+    return Buffer.from(byteArray);
 }
 
 const verifyBits = function (bits, spec, byteOffset, bitOffset) {
@@ -232,9 +316,9 @@ const demuxFlvHeader = function (chunk, offset) {
         }
         else if (frame.predicate) {
             let sliceBundle = sliceByteChunk(chunk, offset, frame.length, frame.type);
-            if (frame.predicate(sliceBundle.slice)) {
+            if (frame.predicate(sliceBundle.buffer)) {
                 console.log(`it ${frame.desc} at offset ${offset}`);
-                return demuxFlvHeader(chunk, offset + sliceBundle.totalLength);
+                return demuxFlvHeader(chunk, offset + sliceBundle.bufferLength);
             } else {
                 throw new Error(`invalid header field at offset ${offset}, it ${frame.desc}`);
             }
@@ -257,22 +341,95 @@ const demuxFLvBody = function (chunk, offset, field) {
 
     if (field === BODY_FIELD.PREVIOUS_TAG_SIZE) {
         let frame = BODY_SPEC[0];
-        let sliceBundle = sliceByteChunk(chunk, offset, frame.length, frame.type);
-        let previousTagSize = sliceBundle.slice.readUInt32BE(0);
-        console.log(`previous tag size is ${previousTagSize}`);
-        demuxFLvBody(chunk, offset + sliceBundle.length, BODY_FIELD.TAG);
-    } else if (filed === BODY_FIELD.TAG) {
-        tagLength = demuxFlvTag(chunk, offset, 0);
-        demuxFLvBody(chunk, offset + tagLength, BODY_FIELD.PREVIOUS_TAG_SIZE);
+        let buf = sliceByteChunk(chunk, offset, frame.length, frame.type);
+        log(speak(frame, buf, offset));
+        demuxFLvBody(chunk, offset + buf.bufferLength, BODY_FIELD.TAG);
+    } else if (field === BODY_FIELD.TAG) {
+        tagLength = demuxFlvTag()(chunk, offset, 0);
+        // demuxFLvBody(chunk, offset + tagLength, BODY_FIELD.PREVIOUS_TAG_SIZE);
     }
 }
 
-const demuxFlvTag = function (chunk, offset, position) {
-    let frame = TAG_SPEC[position];
-    if (frame) {
+const demuxFlvTagData = function (chunk, chunkOffset, offset, dataType, dataSize) {
+    switch (dataType) {
+        case DATA_TYPE.AUDIODATA:
+            break;
+        case DATA_TYPE.VIDEODATA:
+            break;
+        case DATA_TYPE.SCRIPTDATA:
+            demuxFlvScriptData(chunk, chunkOffset, offset, dataSize);
+            break;
+        default:
+            throw new Error('invalid tag data type!');
+    }
+};
 
+const demuxFlvScriptData = function (chunk, chunkOffset, offset, dataSize) {
+    if (offset >= dataSize) {
+        return null;
+    }
+
+    let frame = null;
+    if (offset === 0) {
+        frame = Object.assign({}, SCRIPT_DATA_OBJECT_SPEC[0]);
+        frame.length = dataSize - 3;//3bytes for END field
     } else {
+        frame = SCRIPT_DATA_OBJECT_SPEC['e'];
+    }
 
+    let buf = sliceByteChunk(chunk, chunkOffset + offset, frame.length, frame.type);
+    frame.predicate && frame.predicate(buf);
+    log(speak(frame, buf, offset));
+    return demuxFlvScriptData(chunk, chunkOffset, offset + buf.bufferLength, dataSize);
+};
+
+const demuxFlvTag = function () {
+    let dataType = null;
+    let tagLength = null;
+    let timestamp = 0;
+
+    return function realDeal(chunk, chunkOffset, offset) {
+        if (tagLength && offset > tagLength) {
+            return tagLength;
+        }
+
+        let frame = TAG_SPEC[offset];
+        if (frame) {
+            if (frame.field === TAG_FILED.DATA && tagLength > 11) {
+                demuxFlvTagData(chunk, chunkOffset + offset, 0, dataType, tagLength - 11);
+                return tagLength;
+            }
+
+            let buf = sliceByteChunk(chunk, chunkOffset + offset, frame.length, frame.type);
+
+            frame.predicate && frame.predicate(buf);
+
+            switch (frame.field) {
+                case TAG_FILED.TAG_TYPE:
+                    dataType = frame.eval(buf);
+                    log(speak(frame, buf, offset));
+                    break;
+                case TAG_FILED.DATA_SIZE:
+                    let dataSize = buf.buffer.readUIntBE(0, 3);
+                    tagLength = 11 + dataSize;
+                    log(speak(frame, buf, offset, dataSize));
+                    break;
+                case TAG_FILED.TIMESTAMP:
+                    timestamp = frame.eval(buf);
+                    break;
+                case TAG_FILED.TIMESTAMP_EXTENDED:
+                    timestamp = frame.eval(buf, timestamp);
+                    log(speak(frame, buf, chunkOffset, timestamp));
+                    break;
+                default:
+                    log(speak(frame.desc, buf.buffer));
+                    break;
+            }
+
+            return realDeal(chunk, chunkOffset, offset + buf.bufferLength);
+        } else {
+            throw new Error(`frame at ${chunkOffset + offset} doesn\'t exist!`)
+        }
     }
 };
 
@@ -292,6 +449,8 @@ const readStream = function () {
 
 let stream = fs.createReadStream(path.resolve(__dirname, 'videos', 'sample.flv'))
 stream.on('data', readStream())
-stream.on('error', err => { throw err })
+stream.on('error', err => {
+    throw err
+})
 
 
