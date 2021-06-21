@@ -476,6 +476,7 @@ const readStream = function () {
 }
 
 let stream = fs.createReadStream(path.resolve(__dirname, 'videos', 'sample.flv'))
+
 stream.on('data', readStream())
 stream.on('error', err => {
     throw err
